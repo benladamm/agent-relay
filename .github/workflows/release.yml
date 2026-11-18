@@ -1,0 +1,68 @@
+name: Publish Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build Multi-Platform Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          - os: darwin
+            arch: amd64
+            ext: ""
+          - os: darwin
+            arch: arm64
+            ext: ""
+          - os: windows
+            arch: amd64
+            ext: ".exe"
+
+    steps:
+      - name: Retrieve Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Compile Agent Relay
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p build-dist
+          BIN_NAME="agent-relay-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          go build -trimpath -ldflags="-s -w" -o "build-dist/${BIN_NAME}" ./cmd/agent-relay
+
+      - name: Archive Built Artifacts
+        run: |
+          cd build-dist
+          for file in *; do
+            if [ -f "$file" ]; then
+              tar -czf "${file}.tar.gz" "$file"
+            fi
+          done
+
+      - name: Upload Artifacts to Release Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build-dist/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
