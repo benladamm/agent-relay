@@ -273,8 +273,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					targetPath = m.selectedProj.Path
 				}
 
-				// Find adapter
-				ad, _ := m.registry.Get("claude-code")
+				// Find matching adapter
+				var ad adapter.Adapter
+				if peek, err := bundle.PeekManifest(plainBytes); err == nil {
+					ad, _ = m.registry.Get(peek.AgentName)
+				}
+				if ad == nil {
+					ad, _ = m.registry.Get("claude-code")
+				}
 				manifest, err := bundle.ImportBytes(ad, plainBytes, targetPath)
 				if err != nil {
 					m.errMsg = fmt.Sprintf("Erreur import : %v", err)
@@ -311,7 +317,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.selectedProj != nil && m.selectedProj.Path != "" {
 						targetPath = m.selectedProj.Path
 					}
-					ad, _ := m.registry.Get("claude-code")
+					data, _ := os.ReadFile(bundleFile)
+					var ad adapter.Adapter
+					if peek, err := bundle.PeekManifest(data); err == nil {
+						ad, _ = m.registry.Get(peek.AgentName)
+					}
+					if ad == nil {
+						ad, _ = m.registry.Get("claude-code")
+					}
 					manifest, err := bundle.Import(ad, bundleFile, targetPath)
 					if err != nil {
 						m.errMsg = fmt.Sprintf("Erreur import : %v", err)

@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -24,83 +25,133 @@ func GeneratePasscode() string {
 }
 
 // UploadEncryptedBundle encrypts bundle data with a passcode and uploads to an ephemeral relay.
-// Returns the sharing code (Passcode:RelayID) needed to retrieve and decrypt it.
+// Returns the sharing code (Key-Passcode) needed to retrieve and decrypt it.
 func UploadEncryptedBundle(bundleBytes []byte, passcode string) (string, error) {
 	encrypted, err := EncryptPayload(bundleBytes, passcode)
 	if err != nil {
 		return "", fmt.Errorf("encryption failed: %w", err)
 	}
 
-	// Upload to ephemeral relay (file.io auto-expiring after 1 download)
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("file", "relay-bundle.bin")
+	part, err := writer.CreateFormFile("files[]", "relay.bin")
 	if err != nil {
 		return "", err
 	}
 	if _, err := io.Copy(part, bytes.NewReader(encrypted)); err != nil {
 		return "", err
 	}
-	_ = writer.WriteField("expires", "1d")
-	_ = writer.WriteField("maxDownloads", "2")
 	_ = writer.Close()
 
-	req, err := http.NewRequest("POST", "https://file.io", &body)
+	req, err := http.NewRequest("POST", "https://uguu.se/upload.php", &body)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("User-Agent", "agent-relay/1.0 (curl-compatible)")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("network error during upload: %w", err)
+		return "", fmt.Errorf("erreur réseau pendant le téléversement: %w", err)
 	}
 	defer resp.Body.Close()
 
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("erreur lors de la lecture de la réponse: %w", err)
+	}
+
 	var res struct {
-		Success bool   `json:"success"`
-		Key     string `json:"key"`
-		Link    string `json:"link"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return "", fmt.Errorf("failed parsing relay response: %w", err)
-	}
-
-	if !res.Success || res.Key == "" {
-		return "", fmt.Errorf("relay rejected upload")
+		Success bool `json:"success"`
+		Files   []struct {
+			Name string `json:"name"`
+			URL  string `json:"url"`
+			Size int64  `json:"size"`
+		} `json:"files"`
 	}
 
-	// Sharing code: <KEY>:<PASSCODE>
-	code := fmt.Sprintf("%s-%s", res.Key, passcode)
+	if err := json.Unmarshal(respBytes, &res); err != nil {
+		return "", fmt.Errorf("réponse inattendue du serveur de relais : %s", strings.TrimSpace(string(respBytes)))
+	}
+
+	if !res.Success || len(res.Files) == 0 || res.Files[0].URL == "" {
+		return "", fmt.Errorf("le serveur de relais a refusé l'envoi")
+	}
+
+	rawURL := res.Files[0].URL
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("URL de relais invalide : %w", err)
+	}
+
+	// Host prefix e.g. "h" from "h.uguu.se"
+	hostPrefix := strings.TrimSuffix(parsed.Host, ".uguu.se")
+	filename := strings.TrimPrefix(parsed.Path, "/")
+
+	// Format: <hostPrefix>_<filename>-<passcode>
+	code := fmt.Sprintf("%s_%s-%s", hostPrefix, filename, passcode)
 	return code, nil
 }
 
 // DownloadEncryptedBundle downloads and decrypts a bundle given its sharing code.
 func DownloadEncryptedBundle(shareCode string) ([]byte, error) {
-	parts := strings.Split(strings.TrimSpace(shareCode), "-")
-	if len(parts) < 2 {
+	shareCode = strings.TrimSpace(shareCode)
+	idx := strings.LastIndex(shareCode, "-")
+	if idx == -1 || idx == len(shareCode)-1 {
 		return nil, fmt.Errorf("code de partage invalide (format attendu : ID-MOTDEPASSE)")
 	}
 
-	key := parts[0]
-	passcode := parts[1]
+	key := shareCode[:idx]
+	passcode := shareCode[idx+1:]
 
-	downloadURL := fmt.Sprintf("https://file.io/%s", key)
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(downloadURL)
-	if err != nil {
-		return nil, fmt.Errorf("network error during download: %w", err)
+	var candidateURLs []string
+	if strings.HasPrefix(key, "http://") || strings.HasPrefix(key, "https://") {
+		candidateURLs = append(candidateURLs, key)
+	} else if strings.Contains(key, "_") {
+		parts := strings.SplitN(key, "_", 2)
+		candidateURLs = append(candidateURLs, fmt.Sprintf("https://%s.uguu.se/%s", parts[0], parts[1]))
+		candidateURLs = append(candidateURLs, fmt.Sprintf("https://h.uguu.se/%s", parts[1]))
+		candidateURLs = append(candidateURLs, fmt.Sprintf("https://n.uguu.se/%s", parts[1]))
+	} else {
+		candidateURLs = append(candidateURLs, "https://h.uguu.se/"+key)
+		candidateURLs = append(candidateURLs, "https://n.uguu.se/"+key)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("bundle introuvable ou déjà expiré (HTTP %d)", resp.StatusCode)
+	client := &http.Client{Timeout: 60 * time.Second}
+	var lastErr error
+	var cipherText []byte
+
+	for _, u := range candidateURLs {
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("User-Agent", "agent-relay/1.0 (curl-compatible)")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			data, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err == nil && len(data) > 0 {
+				cipherText = data
+				lastErr = nil
+				break
+			}
+		} else {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d sur %s", resp.StatusCode, u)
+		}
 	}
 
-	cipherText, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
+	if len(cipherText) == 0 {
+		return nil, fmt.Errorf("impossible de récupérer le bundle (expiré ou indisponible): %v", lastErr)
 	}
 
 	plainText, err := DecryptPayload(cipherText, passcode)

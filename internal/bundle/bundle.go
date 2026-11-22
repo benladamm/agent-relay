@@ -128,6 +128,35 @@ func ExportBytes(ad adapter.Adapter, session model.Session, projectPath string) 
 	return buf.Bytes(), nil
 }
 
+// PeekManifest inspects the manifest without extracting the full bundle.
+func PeekManifest(bundleData []byte) (*model.BundleManifest, error) {
+	gr, err := gzip.NewReader(bytes.NewReader(bundleData))
+	if err != nil {
+		return nil, err
+	}
+	defer gr.Close()
+
+	tr := tar.NewReader(gr)
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			break
+		}
+		if hdr.Name == "manifest.json" {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, err
+			}
+			var m model.BundleManifest
+			if err := json.Unmarshal(data, &m); err != nil {
+				return nil, err
+			}
+			return &m, nil
+		}
+	}
+	return nil, fmt.Errorf("manifest.json non trouvé dans le bundle")
+}
+
 // Import unpacks a bundle file from disk.
 func Import(ad adapter.Adapter, bundlePath string, targetProjectPath string) (*model.BundleManifest, error) {
 	data, err := os.ReadFile(bundlePath)
